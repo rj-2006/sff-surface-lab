@@ -75,12 +75,26 @@ def run_pipeline(dataset_path: Path, args) -> dict:
     print("\n[5/6] Computing confidence scores...")
     confidence, mask = compute_confidence(focus_volume, r_squared, fit_valid)
 
+    n_masked = int(np.sum(~mask))
+    print(f"  Confidence-rejected pixels: {n_masked}/{mask.size} "
+          f"({100 * n_masked / mask.size:.1f}%)")
+
     if not args.no_smooth:
         print(f"\n[6/6] Smoothing depth map ({args.smoothing})...")
-        depth_smoothed = smooth_depth_map(depth_map, composite, method=args.smoothing)
+        # PATCH (2026-07-08): previously `mask` was computed but never passed
+        # here, so low-confidence pixels (flat focus curves, poor Gaussian
+        # fits, scan-range-edge peaks) flowed straight into the edge-aware
+        # smoother, which preserved them as fake "edges" instead of removing
+        # them -> spikes around the border and in low-texture interior
+        # regions. Passing confidence_mask makes smooth_depth_map inpaint
+        # those pixels from their reliable local neighbors before smoothing.
+        depth_smoothed = smooth_depth_map(
+            depth_map, composite, confidence_mask=mask, method=args.smoothing
+        )
     else:
         print("\n[6/6] Skipping smoothing (--no-smooth)")
         depth_smoothed = depth_map.copy()
+        depth_smoothed[~mask] = np.nan
 
     print(f"\nSaving outputs...")
     output_dir = DEPTH_MAP_DIR / name

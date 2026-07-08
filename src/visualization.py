@@ -55,7 +55,10 @@ def plot_3d_surface(
 
     dm_filled = dm.copy()
     if np.any(np.isnan(dm_filled)):
-        dm_filled = np.nan_to_num(dm_filled, nan=np.nanmedian(dm))
+        # Use local inpainting instead of global median to avoid cliff artifacts
+        from .smoothing import _inpaint_invalid
+        nan_mask = np.isnan(dm_filled)
+        dm_filled = _inpaint_invalid(dm_filled, nan_mask)
 
     if XY_UM_PER_PIXEL is not None:
         x = np.arange(w) * subsample * XY_UM_PER_PIXEL
