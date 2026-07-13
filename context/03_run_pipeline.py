@@ -33,7 +33,7 @@ from src.drift_check import compute_global_focus_energy
 from src.focus_measure import sum_modified_laplacian, laplacian_energy, tenengrad
 from src.depth_estimation import estimate_depth_gaussian, estimate_depth_argmax, build_all_in_focus
 from src.confidence import compute_confidence
-from src.smoothing import smooth_depth_map, smooth_depth_map_legacy
+from src.smoothing import smooth_depth_map
 from src.visualization import (
     plot_3d_surface, plot_depth_map, plot_confidence_overlay,
     plot_cross_sections, save_composite, plot_diagnostic_dashboard,
@@ -81,22 +81,20 @@ def run_pipeline(dataset_path: Path, args) -> dict:
 
     if not args.no_smooth:
         print(f"\n[6/6] Smoothing depth map ({args.smoothing})...")
-        # PATCH (2026-07-08): Pass confidence_mask so low-confidence pixels
-        # are inpainted from local neighbors before edge-aware smoothing.
+        # PATCH (2026-07-08): previously `mask` was computed but never passed
+        # here, so low-confidence pixels (flat focus curves, poor Gaussian
+        # fits, scan-range-edge peaks) flowed straight into the edge-aware
+        # smoother, which preserved them as fake "edges" instead of removing
+        # them -> spikes around the border and in low-texture interior
+        # regions. Passing confidence_mask makes smooth_depth_map inpaint
+        # those pixels from their reliable local neighbors before smoothing.
         depth_smoothed = smooth_depth_map(
             depth_map, composite, confidence_mask=mask, method=args.smoothing
-        )
-        # Also compute old-style smoothing for comparison toggle in the 3D
-        # plot — this replicates the original code's exact behavior (global-
-        # median NaN fill, no confidence mask, re-NaN after smoothing).
-        depth_smoothed_old = smooth_depth_map_legacy(
-            depth_map, composite, method=args.smoothing
         )
     else:
         print("\n[6/6] Skipping smoothing (--no-smooth)")
         depth_smoothed = depth_map.copy()
         depth_smoothed[~mask] = np.nan
-        depth_smoothed_old = depth_map.copy()
 
     print(f"\nSaving outputs...")
     output_dir = DEPTH_MAP_DIR / name
@@ -124,7 +122,7 @@ def run_pipeline(dataset_path: Path, args) -> dict:
     plot_depth_map(depth_map, f"{name}_raw", output_dir, f"{name} — Raw Depth Map")
     plot_confidence_overlay(depth_smoothed, confidence, mask, name, output_dir)
     plot_cross_sections(depth_smoothed, dataset_name=name, save_dir=output_dir)
-    plot_3d_surface(depth_smoothed, confidence, name, raw_depth_map=depth_smoothed_old)
+    plot_3d_surface(depth_smoothed, confidence, name)
     plot_diagnostic_dashboard(
         depth_smoothed, confidence, mask, composite,
         global_energy, name, output_dir,

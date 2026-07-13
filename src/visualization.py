@@ -27,6 +27,7 @@ def plot_3d_surface(
     dataset_name: str = "surface",
     save_dir: Optional[Path] = None,
     subsample: int = 2,
+    raw_depth_map: Optional[np.ndarray] = None,
 ) -> Path:
     """
     Create an interactive 3D surface plot using Plotly.
@@ -38,11 +39,8 @@ def plot_3d_surface(
         Confidence map for opacity control.
     subsample : int
         Downsample factor for performance (2 = every other pixel).
-
-    Returns
-    -------
-    html_path : Path
-        Path to the saved interactive HTML file.
+    raw_depth_map : np.ndarray, shape (H, W), optional
+        Raw/unsmoothed depth map to allow toggle comparison.
     """
     import plotly.graph_objects as go
 
@@ -71,17 +69,46 @@ def plot_3d_surface(
         x_label = "X (pixels)"
         y_label = "Y (pixels)"
 
-    fig = go.Figure(data=[
+    traces = []
+    
+    # 1. Smoothed/Fixed surface (Visible by default)
+    traces.append(
         go.Surface(
             x=x, y=y, z=dm_filled,
             colorscale='Viridis',
+            name='Smoothed (Fixed)',
+            showscale=True,
             colorbar=dict(
                 title=dict(text='Depth (µm)', side='right')
+            ),
+            visible=True
+        )
+    )
+
+    # 2. Original surface before fix (Hidden by default, uses old smoothing without confidence mask)
+    has_raw = raw_depth_map is not None
+    if has_raw:
+        raw_dm = raw_depth_map[::subsample, ::subsample]
+        raw_filled = raw_dm.copy()
+        if np.any(np.isnan(raw_filled)):
+            raw_filled = np.nan_to_num(raw_filled, nan=np.nanmedian(raw_dm))
+        
+        traces.append(
+            go.Surface(
+                x=x, y=y, z=raw_filled,
+                colorscale='Viridis',
+                name='Original (Before Fix)',
+                showscale=True,
+                colorbar=dict(
+                    title=dict(text='Depth (µm)', side='right')
+                ),
+                visible=False
             )
         )
-    ])
 
-    fig.update_layout(
+    fig = go.Figure(data=traces)
+
+    layout_update = dict(
         title=dict(text=f'{dataset_name} — 3D Surface Reconstruction', font_size=16),
         scene=dict(
             xaxis_title=x_label,
@@ -94,6 +121,34 @@ def plot_3d_surface(
         width=1000,
         height=700,
     )
+
+    if has_raw:
+        layout_update['updatemenus'] = [
+            dict(
+                type="buttons",
+                direction="left",
+                buttons=list([
+                    dict(
+                        args=[{"visible": [True, False]}],
+                        label="Smoothed (Fixed)",
+                        method="update"
+                    ),
+                    dict(
+                        args=[{"visible": [False, True]}],
+                        label="Original (Before Fix)",
+                        method="update"
+                    )
+                ]),
+                pad={"r": 10, "t": 10},
+                showactive=True,
+                x=0.9,
+                xanchor="right",
+                y=1.15,
+                yanchor="top"
+            )
+        ]
+
+    fig.update_layout(**layout_update)
 
     html_path = save_dir / f"{dataset_name}_3d_surface.html"
     fig.write_html(str(html_path))
