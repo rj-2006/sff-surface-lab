@@ -29,6 +29,23 @@ Z_STEP_UM = 1.0
 XY_UM_PER_PIXEL: Optional[float] = None
 
 
+# --- PATCH (2026-07-16) ---
+# Manual fallback for border removal in the 3D model (visualization.py,
+# plot_3d_surface). The automatic border detection there uses the
+# confidence mask + connected-component flood-fill from the image edges,
+# which adapts to the actual (often ragged) shape of the unreliable rim
+# caused by vignetting / registration crop / edge-of-field defocus.
+#
+# If that automatic detection still leaves a sliver of border in the 3D
+# view (e.g. a thin strip that happened to score as "reliable" despite
+# being outside the subject), set this to a nonzero pixel count to also
+# force-exclude a fixed-width frame around the image from the 3D model
+# ONLY. It has no effect on the 2D depth map, confidence overlay, cross
+# sections, or dashboard — those are untouched and still show border data.
+# Start at 0 (automatic detection only) and increase only if needed.
+BORDER_MARGIN_PX: int = 25
+
+
 @dataclass
 class FocusMeasureConfig:
     """Parameters for focus measure computation."""
