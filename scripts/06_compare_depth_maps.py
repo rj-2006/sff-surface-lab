@@ -105,6 +105,76 @@ def best_fit_offset(a, b):
     return offset
 
 
+def register_subpixel(a, b, max_shift=20):
+    """Finds the small XY shift that best aligns b onto a, then shifts b to match.
+
+    Uses a BOUNDED search (+/- max_shift pixels) rather than unconstrained phase
+    correlation. This matters here specifically because chatter marks are periodic:
+    unconstrained phase correlation can lock onto a shift equal to one chatter
+    wavelength (since the pattern looks similar every N pixels) instead of the true,
+    small crop/registration misalignment between tools. Real misalignment between two
+    tools processing the same stack should only be a handful of pixels, so bounding
+    the search to a generous +/- max_shift window avoids that failure mode.
+
+    Returns (b_shifted, (dy, dx)).
+    """
+    a_filled = np.where(np.isfinite(a), a, np.nanmean(a)).astype(np.float32)
+    b_filled = np.where(np.isfinite(b), b, np.nanmean(b)).astype(np.float32)
+
+    h, w = a_filled.shape
+    # Use a central template from 'a' (avoids edge effects) and search for it in a
+    # padded/cropped version of 'b' restricted to +/- max_shift.
+    margin = max_shift + 5
+    if h <= 2 * margin or w <= 2 * margin:
+        # Image too small for this margin; skip registration.
+        print(f"  Image too small for +/-{max_shift}px registration search; skipping registration.")
+        return b_filled, (0.0, 0.0)
+
+    template = a_filled[margin:h - margin, margin:w - margin]
+    search_region = b_filled[margin - max_shift:h - margin + max_shift,
+                              margin - max_shift:w - margin + max_shift]
+
+    result = cv2.matchTemplate(search_region, template, cv2.TM_CCOEFF_NORMED)
+    _, _, _, max_loc = cv2.minMaxLoc(result)
+    # max_loc is (x, y) of the top-left corner of the best match within search_region
+    dx = max_loc[0] - max_shift
+    dy = max_loc[1] - max_shift
+
+    # Sub-pixel refinement via parabolic interpolation around the integer peak
+    py, px = max_loc[1], max_loc[0]
+    if 0 < py < result.shape[0] - 1 and 0 < px < result.shape[1] - 1:
+        dy_sub = 0.5 * (result[py - 1, px] - result[py + 1, px]) / \
+                 (result[py - 1, px] - 2 * result[py, px] + result[py + 1, px] + 1e-9)
+        dx_sub = 0.5 * (result[py, px - 1] - result[py, px + 1]) / \
+                 (result[py, px - 1] - 2 * result[py, px] + result[py, px + 1] + 1e-9)
+        dy += float(np.clip(dy_sub, -1, 1))
+        dx += float(np.clip(dx_sub, -1, 1))
+
+    b_shifted = ndimage.shift(b_filled, shift=(dy, dx), order=1, mode="nearest")
+    return b_shifted, (dy, dx)
+
+
+def fit_and_remove_plane(reference, target):
+    """Fits a plane z = c0 + c1*x + c2*y to (target - reference) and subtracts it from
+    target, removing any tip/tilt mismatch between the two tools' reference frames.
+    Returns (target_corrected, plane_coeffs)."""
+    h, w = reference.shape
+    yy, xx = np.mgrid[0:h, 0:w]
+    mask = np.isfinite(reference) & np.isfinite(target)
+
+    x_flat = xx[mask].astype(np.float64)
+    y_flat = yy[mask].astype(np.float64)
+    diff_flat = (target - reference)[mask]
+
+    A = np.column_stack([np.ones_like(x_flat), x_flat, y_flat])
+    coeffs, *_ = np.linalg.lstsq(A, diff_flat, rcond=None)
+    c0, c1, c2 = coeffs
+
+    plane = c0 + c1 * xx + c2 * yy
+    target_corrected = target - plane
+    return target_corrected, (c0, c1, c2)
+
+
 def compute_rmse(a, b):
     mask = np.isfinite(a) & np.isfinite(b)
     diff = a[mask] - b[mask]
@@ -173,17 +243,37 @@ def main():
     mine_t = trim_border(mine_r, trim_pct)
     other_t = trim_border(other_r, trim_pct)
 
-    offset = best_fit_offset(mine_t, other_t)
-    print(f"Applying best-fit constant offset to {other_name}: {offset:.4f} "
-          f"(tools don't share a z=0 reference, so this is expected/normal)")
-    other_aligned = other_t + offset
+    # --- Stage 0: raw comparison, constant offset only (old behavior, kept as baseline) ---
+    offset0 = best_fit_offset(mine_t, other_t)
+    other_stage0 = other_t + offset0
+    rmse0 = compute_rmse(mine_t, other_stage0)
+    corr0 = compute_correlation(mine_t, other_stage0)
 
-    rmse = compute_rmse(mine_t, other_aligned)
-    corr = compute_correlation(mine_t, other_aligned)
+    # --- Stage 1: sub-pixel XY registration ---
+    print("\nRunning sub-pixel XY registration (phase cross-correlation)...")
+    other_registered, (dy, dx) = register_subpixel(mine_t, other_t)
+    print(f"  Detected shift: dy={dy:.2f} px, dx={dx:.2f} px")
+    offset1 = best_fit_offset(mine_t, other_registered)
+    other_stage1 = other_registered + offset1
+    rmse1 = compute_rmse(mine_t, other_stage1)
+    corr1 = compute_correlation(mine_t, other_stage1)
+
+    # --- Stage 2: plane fit (removes tip/tilt on top of registration) ---
+    print("Fitting and removing plane (tip/tilt) mismatch...")
+    other_stage2, (c0, c1, c2) = fit_and_remove_plane(mine_t, other_stage1)
+    rmse2 = compute_rmse(mine_t, other_stage2)
+    corr2 = compute_correlation(mine_t, other_stage2)
+    print(f"  Plane fit: offset={c0:.4f}, x-slope={c1:.6f}, y-slope={c2:.6f}")
+
+    other_aligned = other_stage2  # final aligned version used for plots/report below
+    rmse = rmse2
+    corr = corr2
 
     print("\n" + "-" * 70)
-    print(f"RMSE:                  {rmse:.4f}")
-    print(f"Pearson correlation:   {corr:.4f}")
+    print("RMSE / correlation at each correction stage:")
+    print(f"  Stage 0 - offset only (original method):        RMSE={rmse0:.4f}  corr={corr0:.4f}")
+    print(f"  Stage 1 - + sub-pixel XY registration:           RMSE={rmse1:.4f}  corr={corr1:.4f}")
+    print(f"  Stage 2 - + plane (tip/tilt) fit (FINAL):        RMSE={rmse2:.4f}  corr={corr2:.4f}")
     print("-" * 70)
 
     print("\nRunning chatter FFT analysis on both depth maps...")
@@ -203,10 +293,15 @@ def main():
         f.write("=" * 40 + "\n")
         f.write(f"Your pipeline file: {my_path}\n")
         f.write(f"{other_name} file: {other_path}\n\n")
-        f.write(f"Shapes after alignment: {mine_t.shape}\n")
-        f.write(f"Constant offset applied to {other_name}: {offset:.4f}\n\n")
-        f.write(f"RMSE: {rmse:.4f}\n")
-        f.write(f"Pearson correlation: {corr:.4f}\n\n")
+        f.write(f"Shapes after alignment: {mine_t.shape}\n\n")
+        f.write("Correction stages:\n")
+        f.write(f"  Stage 0 - constant offset only ({offset0:.4f}):  RMSE={rmse0:.4f}  corr={corr0:.4f}\n")
+        f.write(f"  Stage 1 - + sub-pixel XY registration (dy={dy:.2f}, dx={dx:.2f}):  "
+                f"RMSE={rmse1:.4f}  corr={corr1:.4f}\n")
+        f.write(f"  Stage 2 - + plane/tilt fit (FINAL) (offset={c0:.4f}, x-slope={c1:.6f}, y-slope={c2:.6f}):  "
+                f"RMSE={rmse2:.4f}  corr={corr2:.4f}\n\n")
+        f.write(f"Final RMSE used for reporting: {rmse:.4f}\n")
+        f.write(f"Final Pearson correlation: {corr:.4f}\n\n")
         f.write(f"Your dominant chatter spatial frequency: {my_dom:.5f} cycles/pixel\n")
         f.write(f"{other_name} dominant chatter spatial frequency: {other_dom:.5f} cycles/pixel\n")
     print(f"\nSaved numeric report -> {report_path}")
@@ -258,4 +353,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
