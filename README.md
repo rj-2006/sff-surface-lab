@@ -32,9 +32,12 @@ where `Φ` is the focus measure operator and `ΔZ = 1 µm` is the Z-step.
 | Frame alignment | ECC registration (Evangelidis & Psarakis, 2008) | Robust to blur; corrects mechanical XY stage drift |
 | Focus measure | Sum-Modified-Laplacian (Nayar & Nakagawa, 1994) | Avoids sign-cancellation of the standard Laplacian |
 | Sub-frame depth | Log-Gaussian parabolic interpolation | Achieves sub-micron precision beyond the motor step limit |
-| Smoothing | Joint Bilateral Filter | Smooths noise while preserving sharp cavity walls |
+| Smoothing | Joint Bilateral Filter & Navier-Stokes Inpainting | Smooths noise while preserving sharp cavity walls; local inpainting prevents border spike artifacts |
 | Uncertainty | R² + peak prominence confidence score | Masks unreliable textureless regions |
 | Validation | Split-half consistency test | Proves reconstruction stability without ground truth |
+| Calibration | Checkerboard lateral (X/Y) pixel sizing | Enables physical cavity measurements (area, volume, aspect ratio) |
+| Border Removal | Warp matrix full-stack coverage mask | Extracts true valid data footprint, excluding registration artifacts |
+| Comparison | Sub-pixel XY registration & chatter FFT | Enables accurate comparison against external tools (e.g. Fiji, Helicon) |
 
 ---
 
@@ -73,7 +76,8 @@ sff-surface-lab/
 │   ├── 02_register_frames.py      # ECC alignment (if needed)
 │   ├── 03_run_pipeline.py         # Full reconstruction
 │   ├── 04_compare_focus_measures.py  # Benchmark SML vs others
-│   └── 05_validate_results.py     # Split-half / ground truth
+│   ├── 05_validate_results.py     # Split-half / ground truth
+│   └── 06_compare_depth_maps.py   # Compare depth map vs external tools (Fiji, Helicon, etc.)
 ├── data/                    # Raw image stacks (not in git — see data/README.md)
 ├── outputs/                 # Generated depth maps and 3D models
 ├── SFF_Reconstruction_Book.md  # 25-page technical deep-dive
@@ -102,6 +106,9 @@ python scripts/03_run_pipeline.py
 
 # 6. Validate results (split-half consistency)
 python scripts/05_validate_results.py --mode split-half
+
+# 7. Compare against other tools (optional, interactive)
+python scripts/06_compare_depth_maps.py
 ```
 
 ### Options
@@ -131,6 +138,7 @@ All tunable parameters live in [`src/config.py`](src/config.py). Key defaults:
 | `interp_half_width` | `2` | ±2 frames → 5-point Gaussian fit |
 | `bilateral_d` | `9` | Bilateral filter diameter (pixels) |
 | `confidence_threshold` | `0.3` | Below this, pixel depth is masked |
+| `BORDER_MARGIN_PX` | `25` | Extra manual pixel margin to exclude from 3D model |
 
 ---
 
@@ -151,8 +159,12 @@ outputs/
 │   ├── *_confidence.png          # Confidence overlay
 │   ├── *_cross_sections.png      # Depth profiles (X and Y slices)
 │   └── *_dashboard.png           # Multi-panel diagnostic summary
-└── 3d_models/
-    └── *_3d_surface.html         # Interactive 3D surface (Plotly, open in browser)
+├── 3d_models/
+│   └── *_3d_surface.html         # Interactive 3D surface (Plotly, open in browser)
+└── comparison/                   # Outputs from 06_compare_depth_maps.py
+    ├── comparison_report.txt     # Sub-pixel shift, RMSE, and chatter metrics
+    ├── depth_maps_side_by_side.png # Visual diff
+    └── chatter_fft_comparison.png # Periodicity analysis
 ```
 
 ---
