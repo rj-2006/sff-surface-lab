@@ -160,3 +160,86 @@ def align_stack(
     }
 
     return aligned, info
+
+
+def compute_valid_coverage_mask(
+    shape: tuple[int, int],
+    warp_matrices: list,
+    coverage_threshold: float = 0.999,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Reconstruct exactly which pixels have real (non-border-fill) data in
+    EVERY layer of the aligned stack, from the same warp matrices used to
+    align the frames.
+
+    --- PATCH (2026-07-18) ---
+    WHY: align_stack() warps each frame with borderMode=BORDER_CONSTANT,
+    borderValue=0.0 — any pixel that shifts in from outside the original
+    field of view gets filled with a hard, fabricated 0. That hard edge
+    produces an artificially sharp, high-confidence, high-energy "focus
+    peak" in downstream SFF processing at whatever layer happens to warp
+    there — not real focus. This is invisible to confidence-based masking
+    (which is built to catch weak/flat focus curves, the opposite failure
+    mode), and it's what produced the residual border spikes in the 3D
+    model even after the confidence-mask fix.
+
+    FIX: instead of guessing a fixed pixel margin, warp a same-sized
+    all-ones mask through each frame's ACTUAL warp matrix, using the exact
+    same cv2.warpAffine call (matrix, flags, border handling) as the real
+    image warp. A pixel is only "fully valid" if it had real data in every
+    single layer — anywhere any one layer's warp clipped it, that pixel's
+    whole focus curve across the stack is compromised.
+
+    This is self-adapting per dataset by construction: heavy drift ->
+    wider excluded region, light drift -> almost nothing excluded, and it
+    correctly follows a rotated/skewed invalid boundary (not just a
+    rectangular ring), which a fixed pixel margin cannot.
+
+    Parameters
+    ----------
+    shape : tuple (H, W)
+        Frame dimensions (stack.shape[1:]).
+    warp_matrices : list of np.ndarray (2x3) or None
+        Per-frame warp matrices from align_stack()'s info["warp_matrices"].
+        Identity matrix (or None) is treated as "no warp" (reference frame
+        or a frame where registration failed and the original was kept
+        as-is) — contributes no invalid region.
+    coverage_threshold : float
+        Minimum fraction of the bilinear interpolation neighborhood that
+        must come from real (non-fill) source pixels for a pixel to count
+        as valid. 0.999 requires essentially full coverage — pixels right
+        at the true warp boundary (partial coverage from interpolation)
+        are conservatively excluded rather than kept.
+
+    Returns
+    -------
+    valid_mask : np.ndarray, shape (H, W), bool
+        True where the pixel has real data in every layer of the stack.
+    coverage : np.ndarray, shape (H, W), float32
+        Raw minimum coverage fraction across all layers (1.0 = fully
+        covered in every layer, 0.0 = never covered). Useful for
+        diagnostics / choosing a different threshold.
+    """
+    h, w = shape
+    ones = np.ones((h, w), dtype=np.float32)
+    coverage = np.ones((h, w), dtype=np.float32)
+
+    for warp_matrix in warp_matrices:
+        if warp_matrix is None:
+            continue
+        if np.allclose(warp_matrix, np.eye(2, 3, dtype=np.float32)):
+            # No warp applied (reference frame, or failed registration
+            # where the original frame was kept unwarped) — no fill
+            # introduced, so this layer doesn't reduce coverage.
+            continue
+
+        warped_ones = cv2.warpAffine(
+            ones, warp_matrix, (w, h),
+            flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0.0,
+        )
+        coverage = np.minimum(coverage, warped_ones)
+
+    valid_mask = coverage >= coverage_threshold
+    return valid_mask, coverage

@@ -5,3 +5,4 @@ scipy>=1.10.0
 matplotlib>=3.7.0
 plotly>=5.15.0
 tqdm>=4.65.0
+tifffile>=2023.0.0

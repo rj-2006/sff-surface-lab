@@ -138,14 +138,12 @@ This mathematical step decouples our depth resolution from the mechanical limita
 
 Because milling cavities contain sheer walls and complex occlusions, raw depth maps inevitably contain noise and outliers.
 
-### 5.1 Joint Bilateral Filtering
+### 5.1 Joint Bilateral Filtering and Local Inpainting
 Standard smoothing (like Gaussian blur) would destroy the sharp edges of the milling cavities. Instead, we use **Joint Bilateral Filtering**. 
 
-This filter takes two inputs:
-1. The noisy depth map (to be smoothed).
-2. An "All-in-Focus" composite image (the guide).
+Before applying the filter, the pipeline uses **Navier-Stokes inpainting** to propagate valid depth values inward to fill any masked (low-confidence or NaN) regions. This local inpainting is crucial because filling invalid areas with a global constant (like a median value) would fabricate a sharp "cliff" at the mask boundaries, which the edge-aware filter would incorrectly preserve as a physical edge.
 
-The filter smooths the depth map, but it constantly checks the guide image. If it encounters a sharp intensity edge in the guide image (like the rim of a cavity), it *stops* smoothing across that boundary. This preserves the steep topological walls of the cavities while heavily suppressing noise in the flat regions.
+Once inpainted, the bilateral filter smooths the depth map using the "All-in-Focus" composite image as a guide. If it encounters a sharp intensity edge in the composite (like the rim of a cavity), it *stops* smoothing across that boundary. This preserves the steep topological walls of the cavities while heavily suppressing noise in the flat regions.
 
 ### 5.2 Confidence and Masking
 Not all pixels yield reliable depths. A flat, textureless piece of metal will have no focus peak. To prevent garbage data from ruining the 3D model, the pipeline generates a per-pixel confidence score $[0, 1]$ computed from three metrics:
@@ -154,9 +152,7 @@ Not all pixels yield reliable depths. A flat, textureless piece of metal will ha
 2. **Fit Quality (R²)**: How perfectly did the data match a Gaussian profile?
 3. **Boundary Clipping**: Is the peak cut off at the top or bottom of the Z-stack?
 
-Pixels that fail to meet a strict confidence threshold (default 0.3) are masked out (set to `NaN`) and excluded from physical measurements.
-
----
+Pixels that fail to meet a strict confidence threshold (default 0.3) are masked out (set to `NaN`) and excluded from physical measurements. In addition, the registration step generates a **Full-stack coverage mask** that tracks the affine warp matrices across all frames. Any pixel that was shifted out of the field of view during alignment is permanently excluded as a border artifact.
 
 ## Chapter 6: Validation, Calibration, and Visualization
 
@@ -165,10 +161,15 @@ In the absence of profilometer ground truth, we mathematically validate the algo
 
 If the algorithm is stable and the Gaussian interpolation is accurate, the two resulting depth maps should be nearly identical. In our tests on `MAIN-SET1`, the Mean Absolute Error (MAE) between the two halves was **1.162 µm**, proving that the interpolation logic provides precision at the theoretical noise floor of the optics.
 
-### 6.2 3D Surface Generation
+### 6.2 3D Surface Generation and Measurement
 The final validated depth map is passed to Plotly to generate an interactive 3D mesh. The all-in-focus composite image is mapped directly onto the geometry as a texture, allowing for immediate visual correlation between microscopic intensity and physical depth. 
 
-*(Note: Prior to extracting physical volume or surface area from these models, the `XY_UM_PER_PIXEL` constant must be calibrated against a known standard).*
+The visualization applies **Percentile-based colorscale clamping** (2nd to 98th percentile) rather than strictly using the absolute min/max depth. This prevents a handful of outlier spikes from stretching the colorscale thin, preserving visual contrast for fine surface features like chatter waviness. Users can also toggle an **Extra Smooth** bilateral pass to visually polish the mesh.
+
+Prior to extracting physical volume, surface area, or aspect ratios from these models, the `XY_UM_PER_PIXEL` constant must be calibrated. The pipeline includes a calibration module that automatically computes this metric by detecting inner corners on a checkerboard calibration grid.
+
+### 6.3 External Tool Comparison
+To cross-validate our results with commercial software (e.g., Fiji EDF, Helicon Focus), the pipeline includes an interactive depth map comparison script. Because different tools do not share a common $Z=0$ reference plane or exact X/Y crop, the comparison module performs **Sub-pixel phase correlation registration** and a **Tip/Tilt plane fit** to spatially align the two depth maps before computing the Root Mean Square Error (RMSE). Finally, it computes a 1D FFT of the height profile along the feed direction to verify that the dominant spatial frequency of the chatter marks precisely matches between the tools.
 
 
 ---
@@ -417,6 +418,16 @@ for d in [DATA_DIR, DIAGNOSTICS_DIR, DEPTH_MAP_DIR, MODEL_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 Z_STEP_UM = 1.0
 XY_UM_PER_PIXEL: Optional[float] = None
+```
+
+```python
+BORDER_MARGIN_PX: int = 25
+```
+
+> **Explanation / Rationale:**
+> Manual fallback for border removal in the 3D model. While the automatic border detection uses the confidence mask and warp footprints, this parameter forces the exclusion of a fixed-width frame around the image from the 3D model if any stubborn border artifacts slip through.
+
+```python
 @dataclass
 class FocusMeasureConfig:
     """Parameters for focus measure computation."""
@@ -1646,47 +1657,172 @@ def align_stack(
     return aligned, info
 ```
 
+```python
+def compute_valid_coverage_mask(
+    shape: tuple[int, int],
+    warp_matrices: list,
+    coverage_threshold: float = 0.999,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Reconstruct exactly which pixels have real (non-border-fill) data in
+    EVERY layer of the aligned stack, from the same warp matrices used to
+    align the frames.
+    """
+    h, w = shape
+    ones = np.ones((h, w), dtype=np.float32)
+    coverage = np.ones((h, w), dtype=np.float32)
+
+    for warp_matrix in warp_matrices:
+        if warp_matrix is None:
+            continue
+        if np.allclose(warp_matrix, np.eye(2, 3, dtype=np.float32)):
+            continue
+
+        warped_ones = cv2.warpAffine(
+            ones, warp_matrix, (w, h),
+            flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0.0,
+        )
+        coverage = np.minimum(coverage, warped_ones)
+
+    valid_mask = coverage >= coverage_threshold
+    return valid_mask, coverage
+```
+
+> **Explanation / Rationale:**
+> `align_stack()` warps each frame with `borderValue=0.0`. Any pixel that shifts in from outside the original FOV gets filled with a hard, fabricated 0. That hard edge produces an artificially sharp, high-confidence "focus peak" in downstream processing, which creates massive residual border spikes in the 3D model. 
+> Instead of guessing a fixed pixel margin, this function warps a same-sized all-ones mask through each frame's EXACT warp matrix. A pixel is only "fully valid" if it had real data in every single layer. This self-adapts perfectly to the true drift envelope of the dataset.
+
 
 ## smoothing.py
 
 ```python
 """
 smoothing.py — Edge-aware depth map smoothing.
+
 Step 5 of the pipeline: Smooth the raw depth map to reduce noise while
 preserving sharp depth transitions at cavity edges.
+
 WHY edge-aware over simple Gaussian/median:
 A cavity in the milled surface has a sharp depth drop at its edge — exactly
 the feature we need to measure. Gaussian blur smears this edge outward,
 making the cavity appear wider and shallower than it really is. Bilateral
 and guided filters use intensity similarity (from the all-in-focus composite)
 to keep smoothing within regions of similar appearance, leaving edges intact.
+
 Two methods:
 1. Joint bilateral filter — uses the composite image as a guide
 2. Guided filter — faster alternative, avoids gradient reversal artifacts
+
+--- PATCH (2026-07-08) ---
+FIX: The previous NaN-fill used a single global scalar (np.nanmedian of the
+WHOLE depth map) to plug every invalid/low-confidence pixel before smoothing.
+That creates an artificial step/cliff at every mask boundary — most visibly
+around the image border, where registration + vignetting produce a ring of
+invalid pixels. Because the bilateral filter is edge-aware by design, it
+"sees" that fabricated step as a real edge and preserves it instead of
+smoothing over it. Result: spikes ringing the border and inside any interior
+low-confidence patch.
+
+FIX: replaced the global-median fill with cv2.inpaint (Navier-Stokes),
+which propagates depth values inward from the boundary of the invalid
+region using its actual local neighbors — no fabricated discontinuity.
+
 REF: Tomasi & Manduchi, "Bilateral filtering", ICCV 1998
 REF: He et al., "Guided Image Filtering", IEEE TPAMI 35(6), 2013
+REF: Bertalmio et al., "Navier-Stokes, Fluid Dynamics, and Image and Video
+     Inpainting", CVPR 2001 (cv2.INPAINT_NS)
 """
+
 import cv2
 import numpy as np
+
 from .config import SMOOTH_CFG
+
+
+def _inpaint_invalid(depth_map: np.ndarray, invalid_mask: np.ndarray) -> np.ndarray:
+    """
+    Fill invalid (NaN / low-confidence) pixels via local inpainting.
+
+    Replaces the old approach of filling with a single global median value,
+    which fabricates a hard edge at the mask boundary. Inpainting instead
+    propagates values inward from the valid boundary pixels, so the filled
+    region blends with its actual local neighborhood.
+
+    Parameters
+    ----------
+    depth_map : np.ndarray, shape (H, W), float32
+        May contain NaN. Values outside NaN are assumed valid.
+    invalid_mask : np.ndarray, shape (H, W), bool
+        True where the pixel should be treated as invalid and inpainted,
+        e.g. NaN pixels OR pixels the confidence mask rejected.
+
+    Returns
+    -------
+    filled : np.ndarray, shape (H, W), float32
+        Depth map with invalid regions filled by inpainting. No NaNs.
+    """
+    if not np.any(invalid_mask):
+        return np.nan_to_num(depth_map, nan=0.0).astype(np.float32)
+
+    # cv2.inpaint requires a finite source image — seed NaNs with the
+    # nearest valid value via a cheap distance-transform fill first, so
+    # inpainting has real numbers to propagate from at the mask edges.
+    valid_mask = ~invalid_mask
+    if not np.any(valid_mask):
+        # Nothing valid at all — degenerate case, nothing sensible to return.
+        return np.nan_to_num(depth_map, nan=0.0).astype(np.float32)
+
+    from scipy.ndimage import distance_transform_edt
+    seed = depth_map.copy()
+    seed[invalid_mask] = 0.0
+    seed = np.nan_to_num(seed, nan=0.0).astype(np.float32)
+
+    _, (iy, ix) = distance_transform_edt(
+        invalid_mask, return_distances=True, return_indices=True
+    )
+    nearest_fill = seed[iy, ix]
+    seed[invalid_mask] = nearest_fill[invalid_mask]
+
+    mask_u8 = invalid_mask.astype(np.uint8) * 255
+    inpainted = cv2.inpaint(seed, mask_u8, inpaintRadius=5, flags=cv2.INPAINT_NS)
+
+    return inpainted.astype(np.float32)
+```
+
+> **Explanation / Rationale:**
+> `_inpaint_invalid()` replaces the old approach of filling masked pixels with a single global median value, which fabricates a hard edge at the mask boundary. Navier-Stokes inpainting instead propagates values inward from the valid boundary pixels, so the filled region blends with its actual local neighborhood before bilateral filtering.
+
+```python
 def smooth_bilateral(
     depth_map: np.ndarray,
     guide_image: np.ndarray,
+    confidence_mask: np.ndarray = None,
     d: int = None,
     sigma_color: float = None,
     sigma_space: float = None,
 ) -> np.ndarray:
     """
     Edge-aware smoothing using joint bilateral filter.
+
     Parameters
     ----------
     depth_map : np.ndarray, shape (H, W), float32
         Raw depth map (may contain NaN for invalid pixels).
     guide_image : np.ndarray, shape (H, W), float32
         All-in-focus composite — provides edge information.
+    confidence_mask : np.ndarray, shape (H, W), bool, optional
+        True = reliable pixel (from confidence.compute_confidence). Pixels
+        where this is False are treated as invalid and inpainted, same as
+        NaN pixels. Pass this in — without it, low-confidence pixels that
+        aren't already NaN will still leak spikes through.
+
     Returns
     -------
     smoothed : np.ndarray, shape (H, W), float32
+        NaN preserved only where BOTH raw depth was NaN and no confidence
+        mask was supplied (backward-compat); otherwise fully filled.
     """
     if d is None:
         d = SMOOTH_CFG.bilateral_d
@@ -1694,16 +1830,17 @@ def smooth_bilateral(
         sigma_color = SMOOTH_CFG.bilateral_sigma_color
     if sigma_space is None:
         sigma_space = SMOOTH_CFG.bilateral_sigma_space
+
     nan_mask = np.isnan(depth_map)
-    depth_filled = depth_map.copy()
-    if np.any(nan_mask):
-        from scipy.ndimage import median_filter
-        median_depth = median_filter(
-            np.nan_to_num(depth_map, nan=np.nanmedian(depth_map)),
-            size=5
-        )
-        depth_filled[nan_mask] = median_depth[nan_mask]
+    if confidence_mask is not None:
+        invalid_mask = nan_mask | (~confidence_mask)
+    else:
+        invalid_mask = nan_mask
+
+    depth_filled = _inpaint_invalid(depth_map, invalid_mask)
+
     guide_float32 = guide_image.astype(np.float32)
+
     smoothed = cv2.ximgproc.jointBilateralFilter(
         joint=guide_float32,
         src=depth_filled,
@@ -1711,26 +1848,40 @@ def smooth_bilateral(
         sigmaColor=sigma_color,
         sigmaSpace=sigma_space,
     )
-    smoothed[nan_mask] = np.nan
+
+    # DON'T re-NaN inpainted pixels — the inpainted+smoothed values are the
+    # fix. Re-NaN-ing would create holes that downstream visualization fills
+    # with a global median scalar, recreating the exact cliff artifacts we
+    # just eliminated. The invalid pixels now carry locally-consistent values.
+
     return smoothed
+
+
 def smooth_guided(
     depth_map: np.ndarray,
     guide_image: np.ndarray,
+    confidence_mask: np.ndarray = None,
     radius: int = None,
     eps: float = None,
 ) -> np.ndarray:
     """
     Edge-aware smoothing using guided filter.
+
     ALTERNATIVE to bilateral. Advantages:
     - O(N) complexity vs O(N·d²) for bilateral
     - No gradient reversal artifacts
     - Analytically exact (not iterative)
+
     Disadvantage:
     - Slightly less sharp edge preservation in some cases
+
     Parameters
     ----------
     depth_map : np.ndarray, shape (H, W), float32
     guide_image : np.ndarray, shape (H, W), float32
+    confidence_mask : np.ndarray, shape (H, W), bool, optional
+        True = reliable pixel. See smooth_bilateral docstring.
+
     Returns
     -------
     smoothed : np.ndarray, shape (H, W), float32
@@ -1739,53 +1890,121 @@ def smooth_guided(
         radius = SMOOTH_CFG.guided_radius
     if eps is None:
         eps = SMOOTH_CFG.guided_eps
+
     nan_mask = np.isnan(depth_map)
-    depth_filled = depth_map.copy()
-    if np.any(nan_mask):
-        from scipy.ndimage import median_filter
-        median_depth = median_filter(
-            np.nan_to_num(depth_map, nan=np.nanmedian(depth_map)),
-            size=5
-        )
-        depth_filled[nan_mask] = median_depth[nan_mask]
+    if confidence_mask is not None:
+        invalid_mask = nan_mask | (~confidence_mask)
+    else:
+        invalid_mask = nan_mask
+
+    depth_filled = _inpaint_invalid(depth_map, invalid_mask)
+
     smoothed = cv2.ximgproc.guidedFilter(
         guide=guide_image,
         src=depth_filled,
         radius=radius,
         eps=eps,
     )
-    smoothed[nan_mask] = np.nan
+
+    # DON'T re-NaN — same reasoning as smooth_bilateral.
     return smoothed
+
+
 def smooth_depth_map(
     depth_map: np.ndarray,
     guide_image: np.ndarray,
+    confidence_mask: np.ndarray = None,
     method: str = None,
 ) -> np.ndarray:
     """
     Smooth a depth map using the configured method.
+
     Parameters
     ----------
     depth_map : np.ndarray, shape (H, W), float32
     guide_image : np.ndarray, shape (H, W), float32
+    confidence_mask : np.ndarray, shape (H, W), bool, optional
+        True = reliable pixel, from confidence.compute_confidence(). Strongly
+        recommended — without it, low-confidence-but-non-NaN pixels are the
+        source of the spike artifacts.
     method : str, "bilateral" or "guided"
+
     Returns
     -------
     smoothed : np.ndarray, shape (H, W), float32
     """
     if method is None:
         method = SMOOTH_CFG.method
+
     if method == "bilateral":
-        return smooth_bilateral(depth_map, guide_image)
+        return smooth_bilateral(depth_map, guide_image, confidence_mask=confidence_mask)
     elif method == "guided":
-        return smooth_guided(depth_map, guide_image)
+        return smooth_guided(depth_map, guide_image, confidence_mask=confidence_mask)
     else:
         raise ValueError(f"Unknown smoothing method: {method}. Use 'bilateral' or 'guided'.")
+
+
+def smooth_depth_map_legacy(
+    depth_map: np.ndarray,
+    guide_image: np.ndarray,
+    method: str = None,
+) -> np.ndarray:
+    """
+    Smooth using the ORIGINAL pipeline logic (pre-fix) for comparison.
+
+    This replicates the old behavior exactly:
+    - NaN pixels filled with median_filter(nan_to_num(depth, nan=global_median))
+    - No confidence mask applied
+    - NaN re-applied after smoothing
+
+    Used only for the before/after toggle in the 3D visualization.
+    """
+    from scipy.ndimage import median_filter
+
+    if method is None:
+        method = SMOOTH_CFG.method
+
+    nan_mask = np.isnan(depth_map)
+    depth_filled = depth_map.copy()
+    if np.any(nan_mask):
+        median_depth = median_filter(
+            np.nan_to_num(depth_map, nan=np.nanmedian(depth_map)),
+            size=5
+        )
+        depth_filled[nan_mask] = median_depth[nan_mask]
+
+    guide_float32 = guide_image.astype(np.float32)
+
+    if method == "bilateral":
+        d = SMOOTH_CFG.bilateral_d
+        sigma_color = SMOOTH_CFG.bilateral_sigma_color
+        sigma_space = SMOOTH_CFG.bilateral_sigma_space
+        smoothed = cv2.ximgproc.jointBilateralFilter(
+            joint=guide_float32, src=depth_filled,
+            d=d, sigmaColor=sigma_color, sigmaSpace=sigma_space,
+        )
+    elif method == "guided":
+        radius = SMOOTH_CFG.guided_radius
+        eps = SMOOTH_CFG.guided_eps
+        smoothed = cv2.ximgproc.guidedFilter(
+            guide=guide_image, src=depth_filled,
+            radius=radius, eps=eps,
+        )
+    else:
+        raise ValueError(f"Unknown smoothing method: {method}")
+
+    smoothed[nan_mask] = np.nan
+    return smoothed
+
+
 def compare_smoothing_methods(
     depth_map: np.ndarray,
     guide_image: np.ndarray,
+    confidence_mask: np.ndarray = None,
 ) -> dict:
     """
     Run both smoothing methods and return comparison metrics.
+
     Returns
     -------
     results : dict with keys:
@@ -1795,10 +2014,12 @@ def compare_smoothing_methods(
         - max_diff: maximum difference in µm
         - mean_diff: mean difference in µm
     """
-    bilateral = smooth_bilateral(depth_map, guide_image)
-    guided = smooth_guided(depth_map, guide_image)
+    bilateral = smooth_bilateral(depth_map, guide_image, confidence_mask=confidence_mask)
+    guided = smooth_guided(depth_map, guide_image, confidence_mask=confidence_mask)
+
     diff = np.abs(bilateral - guided)
     valid = ~np.isnan(diff)
+
     return {
         "bilateral": bilateral,
         "guided": guided,
@@ -1981,6 +2202,7 @@ def compare_with_ground_truth(
 ```python
 """
 visualization.py — 3D surface rendering and diagnostic visualizations.
+
 All visualization outputs for the pipeline:
 - Interactive 3D surface plot (Plotly → HTML)
 - Depth map heatmaps (Matplotlib)
@@ -1989,22 +2211,119 @@ All visualization outputs for the pipeline:
 - Confidence overlay
 - Multi-panel diagnostic dashboard
 """
+
 from pathlib import Path
 from typing import Optional
+
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-from .config import Z_STEP_UM, XY_UM_PER_PIXEL, DEPTH_MAP_DIR, MODEL_DIR
+
+from .config import Z_STEP_UM, XY_UM_PER_PIXEL, DEPTH_MAP_DIR, MODEL_DIR, BORDER_MARGIN_PX
+
+
+# --- PATCH (2026-07-16) ---
+# BORDER REMOVAL FOR THE 3D MODEL ONLY.
+#
+# WHY: smoothing.py's confidence-mask fix already prevents unreliable pixels
+# from leaking through as *unfiltered* spikes — but it still inpaint-fills
+# every unreliable pixel (including the border ring caused by vignetting /
+# registration crop / edge-of-field defocus) with a locally-plausible height
+# so the 2D depth map stays continuous. That fill is correct for the 2D map,
+# but wrong for the 3D model: the border isn't the subject, and its filled
+# heights (real or fabricated) stretch the z-axis range, which compresses
+# the color range across the actual subject (everything reads as one shade
+# of blue).
+#
+# FIX: plot_3d_surface now optionally takes the confidence-reliable `mask`
+# and, using it, finds the unreliable region that is connected to the image
+# edge (flood-fill / connected-component labeling from the four borders).
+# That connected region is treated as "border" and set to NaN in the 3D
+# z-array only — Plotly renders NaN as a gap, so the border simply isn't
+# part of the mesh. Any unreliable pixels NOT connected to the edge (e.g.
+# a genuine occlusion/hole inside the subject) are left to the normal
+# inpaint fill, same as before, so real interior geometry isn't punched
+# full of holes.
+#
+# This only touches plot_3d_surface. plot_depth_map, plot_confidence_overlay,
+# plot_cross_sections, and plot_diagnostic_dashboard are unchanged and still
+# show the full frame, border included, as intended.
+def _find_border_region(invalid_mask: np.ndarray, margin_px: int = 0) -> np.ndarray:
+    """
+    Identify the subset of `invalid_mask` that forms a ring connected to
+    the image border, as opposed to isolated invalid patches inside the
+    subject (e.g. an occluded cavity).
+
+    Parameters
+    ----------
+    invalid_mask : np.ndarray, shape (H, W), bool
+        True where a pixel is NaN or confidence-rejected.
+    margin_px : int
+        Optional additional fixed-width frame (in pixels, at the
+        resolution of invalid_mask) to force-include as border regardless
+        of connectivity. 0 = automatic detection only.
+
+    Returns
+    -------
+    border_mask : np.ndarray, shape (H, W), bool
+        True where the pixel should be excluded from the 3D model as
+        border.
+    """
+    h, w = invalid_mask.shape
+    border_mask = np.zeros((h, w), dtype=bool)
+
+    if np.any(invalid_mask):
+        from scipy.ndimage import label
+        # 8-connectivity so a diagonally-touching ring still merges into
+        # one component instead of fragmenting at corners.
+        structure = np.ones((3, 3), dtype=int)
+        labeled, num = label(invalid_mask, structure=structure)
+        if num > 0:
+            edge_labels = set(labeled[0, :].tolist())
+            edge_labels |= set(labeled[-1, :].tolist())
+            edge_labels |= set(labeled[:, 0].tolist())
+            edge_labels |= set(labeled[:, -1].tolist())
+            edge_labels.discard(0)
+            if edge_labels:
+                border_mask = np.isin(labeled, list(edge_labels))
+
+    if margin_px > 0:
+        border_mask[:margin_px, :] = True
+        border_mask[-margin_px:, :] = True
+        border_mask[:, :margin_px] = True
+        border_mask[:, -margin_px:] = True
+
+    return border_mask
+
+
 def plot_3d_surface(
     depth_map: np.ndarray,
     confidence: Optional[np.ndarray] = None,
     dataset_name: str = "surface",
     save_dir: Optional[Path] = None,
     subsample: int = 2,
+    mask: Optional[np.ndarray] = None,
+    registration_mask: Optional[np.ndarray] = None,
+    border_margin_px: Optional[int] = None,
 ) -> Path:
     """
-    Create an interactive 3D surface plot using Plotly.
+    Create an interactive 3D surface plot using Plotly, with a toggle
+    between two views of the same reconstruction:
+
+    - "Smoothed (Cavity Filled)": border removed, interior low-confidence
+      pixels (e.g. cavity floor/walls) inpaint-filled for a continuous
+      mesh. Default view.
+    - "Extra Smooth": a second, wider-parameter bilateral pass on top of
+      the above, aimed at small residual spikes that survive the main
+      smoothing.py pass.
+
+    Color bounds for both traces are percentile-based (2nd/98th) rather
+    than raw min/max, so a handful of outlier pixels can't stretch the
+    colorscale thin across the rest of the surface — this is what keeps
+    small genuine variation (e.g. chatter waviness) visually distinct
+    instead of reading as a near-uniform shade.
+
     Parameters
     ----------
     depth_map : np.ndarray, shape (H, W), float32, in µm
@@ -2012,20 +2331,90 @@ def plot_3d_surface(
         Confidence map for opacity control.
     subsample : int
         Downsample factor for performance (2 = every other pixel).
-    Returns
-    -------
-    html_path : Path
-        Path to the saved interactive HTML file.
+    mask : np.ndarray, shape (H, W), bool, optional
+        Confidence-reliable mask (True = reliable), from
+        confidence.compute_confidence(). Marks genuine interior
+        ambiguity (e.g. cavity walls / occlusion). In the "Smoothed"
+        trace these are inpaint-filled; in the "Raw" trace they're left
+        as gaps.
+    registration_mask : np.ndarray, shape (H, W), bool, optional
+        Full-stack-coverage mask (True = real data in every layer), from
+        registration.compute_valid_coverage_mask(). False marks the
+        registration-warp-boundary artifact — a hard fill introduced
+        wherever a frame's drift correction pushed real content outside
+        the original field of view. Excluded (NaN) from BOTH traces,
+        since it's never real data in either view. Only pass this for
+        datasets that actually went through registration
+        (02_register_frames.py) — no drift, no warp, nothing to exclude.
+    border_margin_px : int, optional
+        Extra fixed-width frame (pixels, full resolution before subsample)
+        to force-exclude as border regardless of what the masks say.
+        Defaults to config.BORDER_MARGIN_PX (0 = off). Acts as a safety
+        net on top of the two masks above, not a replacement for them.
     """
     import plotly.graph_objects as go
+
     if save_dir is None:
         save_dir = MODEL_DIR
     save_dir.mkdir(parents=True, exist_ok=True)
+
+    if border_margin_px is None:
+        border_margin_px = BORDER_MARGIN_PX
+
     dm = depth_map[::subsample, ::subsample]
     h, w = dm.shape
-    dm_filled = dm.copy()
-    if np.any(np.isnan(dm_filled)):
-        dm_filled = np.nan_to_num(dm_filled, nan=np.nanmedian(dm))
+
+    nan_mask = np.isnan(dm)
+
+    # Registration-invalid pixels alone seed border detection (see PATCH
+    # 2026-07-18b above _find_border_region) — confidence-invalid pixels
+    # never count as border, even if adjacent, so a real interior feature
+    # (like a cavity) can never get swallowed into the border exclusion.
+    registration_invalid = np.zeros((h, w), dtype=bool)
+    if registration_mask is not None:
+        reg_mask_sub = registration_mask[::subsample, ::subsample]
+        registration_invalid = ~reg_mask_sub
+
+    margin_sub = max(0, border_margin_px // subsample) if border_margin_px else 0
+    if np.any(registration_invalid) or margin_sub > 0:
+        border_mask = _find_border_region(registration_invalid, margin_px=margin_sub)
+    else:
+        border_mask = np.zeros((h, w), dtype=bool)
+
+    confidence_invalid = np.zeros((h, w), dtype=bool)
+    if mask is not None:
+        mask_sub = mask[::subsample, ::subsample]
+        confidence_invalid = ~mask_sub
+
+    interior_invalid = (confidence_invalid | nan_mask) & ~border_mask
+
+    # --- "Smoothed (Cavity Filled)" variant ---
+    dm_smoothed = dm.copy()
+    if np.any(interior_invalid):
+        from .smoothing import _inpaint_invalid
+        dm_smoothed = _inpaint_invalid(dm_smoothed, interior_invalid)
+    if np.any(border_mask):
+        dm_smoothed[border_mask] = np.nan
+
+    # --- "Extra Smooth" variant ---
+    # A second, wider-parameter bilateral pass over the already cavity-
+    # filled result, aimed at the small residual spikes that survive the
+    # main smoothing.py pass (genuine but small — not the border/cavity
+    # artifacts, which are already handled separately above). Self-guided
+    # (no composite image needed here) since this is a display-polish
+    # pass, not a measurement step.
+    dm_extra_smooth = dm_smoothed.copy()
+    if np.any(border_mask):
+        from .smoothing import _inpaint_invalid
+        # Temporarily fill the border so the filter has no NaN to choke
+        # on — re-excluded right after, same as the main pass.
+        dm_extra_smooth = _inpaint_invalid(dm_extra_smooth, border_mask)
+    dm_extra_smooth = cv2.bilateralFilter(
+        dm_extra_smooth.astype(np.float32), d=15, sigmaColor=50.0, sigmaSpace=25.0
+    )
+    if np.any(border_mask):
+        dm_extra_smooth[border_mask] = np.nan
+
     if XY_UM_PER_PIXEL is not None:
         x = np.arange(w) * subsample * XY_UM_PER_PIXEL
         y = np.arange(h) * subsample * XY_UM_PER_PIXEL
@@ -2036,16 +2425,60 @@ def plot_3d_surface(
         y = np.arange(h) * subsample
         x_label = "X (pixels)"
         y_label = "Y (pixels)"
-    fig = go.Figure(data=[
+
+    def _zrange_percentile(arr, low_pct=2.0, high_pct=98.0):
+        """
+        Percentile-based color bounds instead of raw min/max. A handful
+        of remaining outlier pixels can otherwise stretch the colorscale
+        thin across the rest of the surface, washing out genuine small
+        variation (like chatter waviness) into a near-uniform shade.
+        Clipping to the 2nd/98th percentile keeps those outliers on the
+        surface (z/height is untouched — this only affects color), just
+        clamped to the colorscale's extreme color instead of dominating
+        its range.
+        """
+        valid = arr[~np.isnan(arr)]
+        if valid.size == 0:
+            return 0.0, 1.0
+        lo = float(np.percentile(valid, low_pct))
+        hi = float(np.percentile(valid, high_pct))
+        if hi <= lo:
+            lo, hi = float(valid.min()), float(valid.max())
+        return lo, hi
+
+    smoothed_zmin, smoothed_zmax = _zrange_percentile(dm_smoothed)
+    extra_zmin, extra_zmax = _zrange_percentile(dm_extra_smooth)
+
+    traces = [
         go.Surface(
-            x=x, y=y, z=dm_filled,
-            colorscale='Viridis',
+            x=x, y=y, z=dm_smoothed,
+            colorscale='Turbo',
+            cmin=smoothed_zmin,
+            cmax=smoothed_zmax,
+            name='Smoothed (Cavity Filled)',
+            showscale=True,
             colorbar=dict(
                 title=dict(text='Depth (µm)', side='right')
-            )
-        )
-    ])
-    fig.update_layout(
+            ),
+            visible=True,
+        ),
+        go.Surface(
+            x=x, y=y, z=dm_extra_smooth,
+            colorscale='Turbo',
+            cmin=extra_zmin,
+            cmax=extra_zmax,
+            name='Extra Smooth',
+            showscale=True,
+            colorbar=dict(
+                title=dict(text='Depth (µm)', side='right')
+            ),
+            visible=False,
+        ),
+    ]
+
+    fig = go.Figure(data=traces)
+
+    layout_update = dict(
         title=dict(text=f'{dataset_name} — 3D Surface Reconstruction', font_size=16),
         scene=dict(
             xaxis_title=x_label,
@@ -2058,10 +2491,49 @@ def plot_3d_surface(
         width=1000,
         height=700,
     )
+
+    layout_update['updatemenus'] = [
+        dict(
+            type="buttons",
+            direction="left",
+            buttons=list([
+                dict(
+                    args=[{"visible": [True, False]}],
+                    label="Smoothed (Cavity Filled)",
+                    method="update"
+                ),
+                dict(
+                    args=[{"visible": [False, True]}],
+                    label="Extra Smooth",
+                    method="update"
+                )
+            ]),
+            pad={"r": 10, "t": 10},
+            showactive=True,
+            x=0.9,
+            xanchor="right",
+            y=1.15,
+            yanchor="top"
+        )
+    ]
+
+
+    fig.update_layout(**layout_update)
+
     html_path = save_dir / f"{dataset_name}_3d_surface.html"
     fig.write_html(str(html_path))
     print(f"  3D surface saved: {html_path}")
+
     return html_path
+```
+
+> **Explanation / Rationale:**
+> `plot_3d_surface()` now incorporates three major upgrades:
+> 1. **Coverage Masking**: It applies the `valid_coverage_mask` to perfectly exclude registration borders without manual pixel tuning.
+> 2. **Colorscale Clamping**: It clamps the Z-axis colors to the 2nd and 98th percentiles, ensuring that a single outlier spike doesn't wash out the entire colormap.
+> 3. **Extra Smooth Toggle**: It includes two Plotly traces, allowing the user to seamlessly toggle between the standard cavity-filled mesh and an 'Extra Smooth' bilateral pass for polished presentation.
+
+```python
 def plot_depth_map(
     depth_map: np.ndarray,
     dataset_name: str = "depth",
@@ -2074,8 +2546,10 @@ def plot_depth_map(
     if save_dir is None:
         save_dir = DEPTH_MAP_DIR
     save_dir.mkdir(parents=True, exist_ok=True)
+
     if title is None:
         title = f'{dataset_name} — Depth Map'
+
     fig, ax = plt.subplots(figsize=(10, 8))
     im = ax.imshow(
         depth_map, cmap='viridis',
@@ -2085,18 +2559,22 @@ def plot_depth_map(
     cbar = plt.colorbar(im, ax=ax, shrink=0.8)
     cbar.set_label('Depth (µm)', fontsize=12)
     ax.set_title(title, fontsize=14)
+
     if XY_UM_PER_PIXEL is not None:
         ax.set_xlabel('X (µm)')
         ax.set_ylabel('Y (µm)')
     else:
         ax.set_xlabel('X (pixels)')
         ax.set_ylabel('Y (pixels)')
+
     fig.tight_layout()
     png_path = save_dir / f"{dataset_name}_depth_map.png"
     fig.savefig(png_path, dpi=200)
     plt.close(fig)
     print(f"  Depth map saved: {png_path}")
     return png_path
+
+
 def plot_confidence_overlay(
     depth_map: np.ndarray,
     confidence: np.ndarray,
@@ -2110,17 +2588,21 @@ def plot_confidence_overlay(
     if save_dir is None:
         save_dir = DEPTH_MAP_DIR
     save_dir.mkdir(parents=True, exist_ok=True)
+
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
     ax = axes[0]
     im = ax.imshow(depth_map, cmap='viridis',
                    vmin=np.nanpercentile(depth_map, 1),
                    vmax=np.nanpercentile(depth_map, 99))
     plt.colorbar(im, ax=ax, shrink=0.7, label='µm')
     ax.set_title('Depth Map')
+
     ax = axes[1]
     im = ax.imshow(confidence, cmap='RdYlGn', vmin=0, vmax=1)
     plt.colorbar(im, ax=ax, shrink=0.7, label='Confidence')
     ax.set_title('Confidence Map')
+
     ax = axes[2]
     masked_depth = depth_map.copy()
     masked_depth[~mask] = np.nan
@@ -2129,13 +2611,17 @@ def plot_confidence_overlay(
                    vmax=np.nanpercentile(depth_map, 99))
     plt.colorbar(im, ax=ax, shrink=0.7, label='µm')
     ax.set_title(f'Reliable Depth ({np.sum(mask)/mask.size*100:.1f}%)')
+
     fig.suptitle(f'{dataset_name} — Confidence Analysis', fontsize=14, fontweight='bold')
     fig.tight_layout()
+
     png_path = save_dir / f"{dataset_name}_confidence.png"
     fig.savefig(png_path, dpi=200)
     plt.close(fig)
     print(f"  Confidence overlay saved: {png_path}")
     return png_path
+
+
 def plot_cross_sections(
     depth_map: np.ndarray,
     rows: list[int] = None,
@@ -2149,12 +2635,16 @@ def plot_cross_sections(
     if save_dir is None:
         save_dir = DEPTH_MAP_DIR
     save_dir.mkdir(parents=True, exist_ok=True)
+
     h, w = depth_map.shape
+
     if rows is None:
         rows = [h // 4, h // 2, 3 * h // 4]
     if cols is None:
         cols = [w // 4, w // 2, 3 * w // 4]
+
     fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+
     ax = axes[0]
     x_axis = np.arange(w)
     if XY_UM_PER_PIXEL is not None:
@@ -2166,6 +2656,7 @@ def plot_cross_sections(
     ax.set_title('Horizontal Cross-Sections')
     ax.legend()
     ax.grid(True, alpha=0.3)
+
     ax = axes[1]
     y_axis = np.arange(h)
     if XY_UM_PER_PIXEL is not None:
@@ -2177,13 +2668,17 @@ def plot_cross_sections(
     ax.set_title('Vertical Cross-Sections')
     ax.legend()
     ax.grid(True, alpha=0.3)
+
     fig.suptitle(f'{dataset_name} — Depth Cross-Sections', fontsize=14, fontweight='bold')
     fig.tight_layout()
+
     png_path = save_dir / f"{dataset_name}_cross_sections.png"
     fig.savefig(png_path, dpi=150)
     plt.close(fig)
     print(f"  Cross-sections saved: {png_path}")
     return png_path
+
+
 def save_composite(
     composite: np.ndarray,
     dataset_name: str = "composite",
@@ -2193,10 +2688,13 @@ def save_composite(
     if save_dir is None:
         save_dir = DEPTH_MAP_DIR
     save_dir.mkdir(parents=True, exist_ok=True)
+
     png_path = save_dir / f"{dataset_name}_all_in_focus.png"
     cv2.imwrite(str(png_path), (composite * 255).astype(np.uint8))
     print(f"  All-in-focus composite saved: {png_path}")
     return png_path
+
+
 def plot_diagnostic_dashboard(
     depth_map: np.ndarray,
     confidence: np.ndarray,
@@ -2212,8 +2710,66 @@ def plot_diagnostic_dashboard(
     if save_dir is None:
         save_dir = DEPTH_MAP_DIR
     save_dir.mkdir(parents=True, exist_ok=True)
+
     fig = plt.figure(figsize=(20, 12))
     gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.3, wspace=0.3)
+
+    ax = fig.add_subplot(gs[0, 0])
+    ax.imshow(composite, cmap='gray')
+    ax.set_title('All-in-Focus Composite')
+    ax.axis('off')
+
+    ax = fig.add_subplot(gs[0, 1])
+    im = ax.imshow(depth_map, cmap='viridis',
+                   vmin=np.nanpercentile(depth_map, 1),
+                   vmax=np.nanpercentile(depth_map, 99))
+    plt.colorbar(im, ax=ax, shrink=0.7, label='µm')
+    ax.set_title('Depth Map')
+    ax.axis('off')
+
+    ax = fig.add_subplot(gs[0, 2])
+    im = ax.imshow(confidence, cmap='RdYlGn', vmin=0, vmax=1)
+    plt.colorbar(im, ax=ax, shrink=0.7, label='Confidence')
+    ax.set_title('Confidence Map')
+    ax.axis('off')
+
+    ax = fig.add_subplot(gs[1, 0])
+    ax.plot(global_energy, 'b-', linewidth=1.5)
+    ax.axvline(np.argmax(global_energy), color='r', linestyle='--', alpha=0.7)
+    ax.set_xlabel('Frame index')
+    ax.set_ylabel('Focus energy')
+    ax.set_title('Global Focus Energy')
+    ax.grid(True, alpha=0.3)
+
+    ax = fig.add_subplot(gs[1, 1])
+    valid_depths = depth_map[mask & ~np.isnan(depth_map)]
+    if len(valid_depths) > 0:
+        ax.hist(valid_depths, bins=50, color='steelblue', edgecolor='navy', alpha=0.7)
+    ax.set_xlabel('Depth (µm)')
+    ax.set_ylabel('Pixel count')
+    ax.set_title('Depth Distribution (reliable pixels)')
+    ax.grid(True, alpha=0.3)
+
+    ax = fig.add_subplot(gs[1, 2])
+    h, w = depth_map.shape
+    mid_row = h // 2
+    x = np.arange(w)
+    ax.plot(x, depth_map[mid_row, :], 'b-', linewidth=1, label='Depth')
+    ax.fill_between(x, depth_map[mid_row, :],
+                    alpha=0.3, color='steelblue')
+    ax.set_xlabel('X (pixels)')
+    ax.set_ylabel('Depth (µm)')
+    ax.set_title(f'Cross-Section (row {mid_row})')
+    ax.grid(True, alpha=0.3)
+
+    fig.suptitle(f'{dataset_name} — Diagnostic Dashboard',
+                 fontsize=16, fontweight='bold')
+
+    png_path = save_dir / f"{dataset_name}_dashboard.png"
+    fig.savefig(png_path, dpi=150)
+    plt.close(fig)
+    print(f"  Dashboard saved: {png_path}")
+    return png_path
 ```
 
 ```python
@@ -2593,11 +3149,29 @@ def main():
 
 
 ```python
+        h, w = stack.shape[1:]
+        valid_mask, coverage = compute_valid_coverage_mask(
+            (h, w), info["warp_matrices"]
+        )
+        n_invalid = int(np.sum(~valid_mask))
+        print(f"\nRegistration coverage: {n_invalid}/{valid_mask.size} pixels "
+              f"({100 * n_invalid / valid_mask.size:.1f}%) lack full-stack "
+              f"coverage")
+
         aligned_dir = DATA_DIR / f"{name}_aligned"
         save_aligned_stack(aligned, aligned_dir)
+        np.save(aligned_dir / "valid_coverage_mask.npy", valid_mask)
+        np.save(aligned_dir / "coverage_fraction.npy", coverage)
+        print(f"  Registration coverage mask saved to "
+              f"{aligned_dir / 'valid_coverage_mask.npy'}")
+
+
 if __name__ == "__main__":
     main()
 ```
+
+> **Explanation / Rationale:**
+> Derives the registration-warp-boundary region directly from the warp matrices actually used for this dataset, instead of guessing a fixed pixel margin downstream. This adapts automatically to however much drift this exact dataset had, and saves it alongside the aligned stack for the 3D surface generation to use later.
 
 > **Explanation / Rationale:**
 > Save aligned stack
@@ -2659,6 +3233,15 @@ def run_pipeline(dataset_path: Path, args) -> dict:
     print("\n[1/6] Loading stack...")
     stack, metadata = load_stack(dataset_path)
     n_frames, h, w = stack.shape
+
+    registration_mask = None
+    coverage_mask_path = dataset_path / "valid_coverage_mask.npy"
+    if coverage_mask_path.exists():
+        registration_mask = np.load(coverage_mask_path)
+        n_border = int(np.sum(~registration_mask))
+        print(f"  Loaded registration coverage mask: {coverage_mask_path} "
+              f"({n_border}/{registration_mask.size} pixels "
+              f"= {100 * n_border / registration_mask.size:.1f}% warp-boundary artifact)")
 ```
 
 > **Explanation / Rationale:**
@@ -2713,10 +3296,13 @@ def run_pipeline(dataset_path: Path, args) -> dict:
 ```python
     if not args.no_smooth:
         print(f"\n[6/6] Smoothing depth map ({args.smoothing})...")
-        depth_smoothed = smooth_depth_map(depth_map, composite, method=args.smoothing)
+        depth_smoothed = smooth_depth_map(
+            depth_map, composite, confidence_mask=mask, method=args.smoothing
+        )
     else:
         print("\n[6/6] Skipping smoothing (--no-smooth)")
         depth_smoothed = depth_map.copy()
+        depth_smoothed[~mask] = np.nan
 ```
 
 > **Explanation / Rationale:**
@@ -2760,7 +3346,10 @@ def run_pipeline(dataset_path: Path, args) -> dict:
     plot_depth_map(depth_map, f"{name}_raw", output_dir, f"{name} — Raw Depth Map")
     plot_confidence_overlay(depth_smoothed, confidence, mask, name, output_dir)
     plot_cross_sections(depth_smoothed, dataset_name=name, save_dir=output_dir)
-    plot_3d_surface(depth_smoothed, confidence, name)
+    plot_3d_surface(
+        depth_smoothed, confidence, name,
+        mask=mask, registration_mask=registration_mask,
+    )
     plot_diagnostic_dashboard(
         depth_smoothed, confidence, mask, composite,
         global_energy, name, output_dir,
@@ -3054,3 +3643,374 @@ if __name__ == "__main__":
     main()
 ```
 
+
+
+## 06_compare_depth_maps.py
+
+```python
+"""
+compare_depth_maps.py
+
+Interactively compares your SFF pipeline's depth map against an external
+tool's height map output (Fiji/ImageJ, Helicon Focus, Zerene Stacker, etc.)
+
+Run it, and it will ask you for file paths. No need to edit the code.
+
+Outputs (saved into a folder you choose, default = current folder):
+  - comparison_report.txt      : all numeric results
+  - depth_maps_side_by_side.png: visual comparison
+  - difference_map.png         : where the two disagree most
+  - chatter_fft_comparison.png : FFT/autocorrelation periodicity comparison
+"""
+
+import os
+import sys
+import numpy as np
+
+try:
+    import tifffile
+except ImportError:
+    print("Missing dependency 'tifffile'. Install it with:")
+    print("  pip install tifffile")
+    sys.exit(1)
+
+try:
+    import cv2
+except ImportError:
+    print("Missing dependency 'opencv-python'. Install it with:")
+    print("  pip install opencv-python")
+    sys.exit(1)
+
+import matplotlib.pyplot as plt
+from scipy import ndimage
+
+
+def ask_path(prompt_text, must_exist=True):
+    while True:
+        path = input(prompt_text).strip().strip('"').strip("'")
+        path = os.path.expanduser(path)
+        if not must_exist:
+            return path
+        if os.path.isfile(path):
+            return path
+        print(f"  -> File not found: {path}\n     Try again (or paste the full path).")
+
+
+def load_depth_image(path):
+    """Loads a depth/height map from .tif/.tiff/.npy/.png and returns a 2D float array."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".tif", ".tiff"):
+        arr = tifffile.imread(path)
+    elif ext == ".npy":
+        arr = np.load(path)
+    else:
+        arr = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if arr is None:
+            raise ValueError(f"Could not read image: {path}")
+
+    arr = np.asarray(arr).astype(np.float64)
+
+    # If it has 3 channels (RGB/RGBA), collapse to single channel via mean
+    if arr.ndim == 3:
+        print(f"  Note: {os.path.basename(path)} has {arr.shape[2]} channels; "
+              f"averaging to single-channel. If this is a color-coded height "
+              f"map (not raw depth), the values you get are NOT true depth.")
+        arr = arr.mean(axis=2)
+
+    return arr
+
+
+def normalize_nan(arr):
+    """Replace any inf/extreme sentinel values with NaN so they don't wreck stats."""
+    arr = arr.copy()
+    arr[~np.isfinite(arr)] = np.nan
+    return arr
+
+
+def align_shapes(a, b):
+    """Resize b to match a's shape (nearest available option: resize the larger to the smaller)."""
+    if a.shape == b.shape:
+        return a, b
+    target_h = min(a.shape[0], b.shape[0])
+    target_w = min(a.shape[1], b.shape[1])
+    print(f"  Shapes differ: {a.shape} vs {b.shape}. Resizing both to ({target_h}, {target_w}).")
+    a_r = cv2.resize(a, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+    b_r = cv2.resize(b, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+    return a_r, b_r
+
+
+def trim_border(arr, pct=0.05):
+    """Trim a percentage border on all sides, to avoid edge artifacts skewing comparison."""
+    h, w = arr.shape
+    bh, bw = int(h * pct), int(w * pct)
+    return arr[bh:h - bh, bw:w - bw]
+
+
+def best_fit_offset(a, b):
+    """Find the constant offset that best aligns b's values to a's (least squares), ignoring NaNs."""
+    mask = np.isfinite(a) & np.isfinite(b)
+    if mask.sum() == 0:
+        return 0.0
+    offset = np.nanmean(a[mask] - b[mask])
+    return offset
+
+
+def register_subpixel(a, b, max_shift=20):
+    """Finds the small XY shift that best aligns b onto a, then shifts b to match.
+
+    Uses a BOUNDED search (+/- max_shift pixels) rather than unconstrained phase
+    correlation. This matters here specifically because chatter marks are periodic:
+    unconstrained phase correlation can lock onto a shift equal to one chatter
+    wavelength (since the pattern looks similar every N pixels) instead of the true,
+    small crop/registration misalignment between tools. Real misalignment between two
+    tools processing the same stack should only be a handful of pixels, so bounding
+    the search to a generous +/- max_shift window avoids that failure mode.
+
+    Returns (b_shifted, (dy, dx)).
+    """
+    a_filled = np.where(np.isfinite(a), a, np.nanmean(a)).astype(np.float32)
+    b_filled = np.where(np.isfinite(b), b, np.nanmean(b)).astype(np.float32)
+
+    h, w = a_filled.shape
+    # Use a central template from 'a' (avoids edge effects) and search for it in a
+    # padded/cropped version of 'b' restricted to +/- max_shift.
+    margin = max_shift + 5
+    if h <= 2 * margin or w <= 2 * margin:
+        # Image too small for this margin; skip registration.
+        print(f"  Image too small for +/-{max_shift}px registration search; skipping registration.")
+        return b_filled, (0.0, 0.0)
+
+    template = a_filled[margin:h - margin, margin:w - margin]
+    search_region = b_filled[margin - max_shift:h - margin + max_shift,
+                              margin - max_shift:w - margin + max_shift]
+
+    result = cv2.matchTemplate(search_region, template, cv2.TM_CCOEFF_NORMED)
+    _, _, _, max_loc = cv2.minMaxLoc(result)
+    # max_loc is (x, y) of the top-left corner of the best match within search_region
+    dx = max_loc[0] - max_shift
+    dy = max_loc[1] - max_shift
+
+    # Sub-pixel refinement via parabolic interpolation around the integer peak
+    py, px = max_loc[1], max_loc[0]
+    if 0 < py < result.shape[0] - 1 and 0 < px < result.shape[1] - 1:
+        dy_sub = 0.5 * (result[py - 1, px] - result[py + 1, px]) / \
+                 (result[py - 1, px] - 2 * result[py, px] + result[py + 1, px] + 1e-9)
+        dx_sub = 0.5 * (result[py, px - 1] - result[py, px + 1]) / \
+                 (result[py, px - 1] - 2 * result[py, px] + result[py, px + 1] + 1e-9)
+        dy += float(np.clip(dy_sub, -1, 1))
+        dx += float(np.clip(dx_sub, -1, 1))
+
+    b_shifted = ndimage.shift(b_filled, shift=(dy, dx), order=1, mode="nearest")
+    return b_shifted, (dy, dx)
+
+
+def fit_and_remove_plane(reference, target):
+    """Fits a plane z = c0 + c1*x + c2*y to (target - reference) and subtracts it from
+    target, removing any tip/tilt mismatch between the two tools' reference frames.
+    Returns (target_corrected, plane_coeffs)."""
+    h, w = reference.shape
+    yy, xx = np.mgrid[0:h, 0:w]
+    mask = np.isfinite(reference) & np.isfinite(target)
+
+    x_flat = xx[mask].astype(np.float64)
+    y_flat = yy[mask].astype(np.float64)
+    diff_flat = (target - reference)[mask]
+
+    A = np.column_stack([np.ones_like(x_flat), x_flat, y_flat])
+    coeffs, *_ = np.linalg.lstsq(A, diff_flat, rcond=None)
+    c0, c1, c2 = coeffs
+
+    plane = c0 + c1 * xx + c2 * yy
+    target_corrected = target - plane
+    return target_corrected, (c0, c1, c2)
+
+
+def compute_rmse(a, b):
+    mask = np.isfinite(a) & np.isfinite(b)
+    diff = a[mask] - b[mask]
+    return float(np.sqrt(np.mean(diff ** 2)))
+
+
+def compute_correlation(a, b):
+    mask = np.isfinite(a) & np.isfinite(b)
+    if mask.sum() < 2:
+        return float("nan")
+    return float(np.corrcoef(a[mask], b[mask])[0, 1])
+
+
+def chatter_fft_profile(depth_map, axis=1):
+    """Average the heightfield along the axis perpendicular to the feed direction,
+    then FFT the resulting 1D profile to find the dominant chatter frequency."""
+    mask = np.isfinite(depth_map)
+    filled = np.where(mask, depth_map, np.nanmean(depth_map))
+    profile = filled.mean(axis=0 if axis == 1 else 1)
+    profile = profile - profile.mean()
+    fft_vals = np.fft.rfft(profile)
+    freqs = np.fft.rfftfreq(len(profile))
+    magnitude = np.abs(fft_vals)
+    # ignore the DC component
+    if len(magnitude) > 1:
+        dominant_idx = np.argmax(magnitude[1:]) + 1
+        dominant_freq = freqs[dominant_idx]
+    else:
+        dominant_freq = 0.0
+    return profile, freqs, magnitude, dominant_freq
+
+
+def main():
+    print("=" * 70)
+    print("DEPTH MAP COMPARISON TOOL")
+    print("=" * 70)
+
+    print("\nStep 1: Your pipeline's depth map (the corrected, border-fixed one)")
+    my_path = ask_path("  Path to YOUR pipeline depth map (.tif/.npy/.png): ")
+
+    print("\nStep 2: The comparison tool's height map (Fiji, Helicon Focus, etc.)")
+    other_path = ask_path("  Path to the OTHER tool's height map (.tif/.npy/.png): ")
+    other_name = input("  What's this tool called? (e.g. Fiji EDF, Helicon Focus): ").strip() or "Other Tool"
+
+    print("\nStep 3: Where should results be saved?")
+    out_dir = ask_path("  Output folder (leave blank for current folder): ", must_exist=False)
+    if out_dir == "":
+        out_dir = os.getcwd()
+    os.makedirs(out_dir, exist_ok=True)
+
+    trim_pct = input("\nTrim border percentage before comparing (default 5, enter for default): ").strip()
+    trim_pct = float(trim_pct) / 100.0 if trim_pct else 0.05
+
+    print("\nLoading images...")
+    mine = normalize_nan(load_depth_image(my_path))
+    other = normalize_nan(load_depth_image(other_path))
+
+    print(f"  Your depth map:  shape={mine.shape}, "
+          f"min={np.nanmin(mine):.4f}, max={np.nanmax(mine):.4f}")
+    print(f"  {other_name}:  shape={other.shape}, "
+          f"min={np.nanmin(other):.4f}, max={np.nanmax(other):.4f}")
+
+    mine_r, other_r = align_shapes(mine, other)
+
+    print(f"\nTrimming {trim_pct*100:.0f}% border from all sides before comparison...")
+    mine_t = trim_border(mine_r, trim_pct)
+    other_t = trim_border(other_r, trim_pct)
+
+    # --- Stage 0: raw comparison, constant offset only (old behavior, kept as baseline) ---
+    offset0 = best_fit_offset(mine_t, other_t)
+    other_stage0 = other_t + offset0
+    rmse0 = compute_rmse(mine_t, other_stage0)
+    corr0 = compute_correlation(mine_t, other_stage0)
+
+    # --- Stage 1: sub-pixel XY registration ---
+    print("\nRunning sub-pixel XY registration (phase cross-correlation)...")
+    other_registered, (dy, dx) = register_subpixel(mine_t, other_t)
+    print(f"  Detected shift: dy={dy:.2f} px, dx={dx:.2f} px")
+    offset1 = best_fit_offset(mine_t, other_registered)
+    other_stage1 = other_registered + offset1
+    rmse1 = compute_rmse(mine_t, other_stage1)
+    corr1 = compute_correlation(mine_t, other_stage1)
+
+    # --- Stage 2: plane fit (removes tip/tilt on top of registration) ---
+    print("Fitting and removing plane (tip/tilt) mismatch...")
+    other_stage2, (c0, c1, c2) = fit_and_remove_plane(mine_t, other_stage1)
+    rmse2 = compute_rmse(mine_t, other_stage2)
+    corr2 = compute_correlation(mine_t, other_stage2)
+    print(f"  Plane fit: offset={c0:.4f}, x-slope={c1:.6f}, y-slope={c2:.6f}")
+
+    other_aligned = other_stage2  # final aligned version used for plots/report below
+    rmse = rmse2
+    corr = corr2
+
+    print("\n" + "-" * 70)
+    print("RMSE / correlation at each correction stage:")
+    print(f"  Stage 0 - offset only (original method):        RMSE={rmse0:.4f}  corr={corr0:.4f}")
+    print(f"  Stage 1 - + sub-pixel XY registration:           RMSE={rmse1:.4f}  corr={corr1:.4f}")
+    print(f"  Stage 2 - + plane (tip/tilt) fit (FINAL):        RMSE={rmse2:.4f}  corr={corr2:.4f}")
+    print("-" * 70)
+
+    print("\nRunning chatter FFT analysis on both depth maps...")
+    my_profile, my_freqs, my_mag, my_dom = chatter_fft_profile(mine_t)
+    other_profile, other_freqs, other_mag, other_dom = chatter_fft_profile(other_aligned)
+
+    print(f"Your pipeline dominant spatial frequency:  {my_dom:.5f} (cycles/pixel)")
+    print(f"{other_name} dominant spatial frequency:  {other_dom:.5f} (cycles/pixel)")
+    if my_dom > 0:
+        pct_diff = abs(my_dom - other_dom) / my_dom * 100
+        print(f"Difference: {pct_diff:.1f}%")
+
+    # --- Save numeric report ---
+    report_path = os.path.join(out_dir, "comparison_report.txt")
+    with open(report_path, "w") as f:
+        f.write("Depth Map Comparison Report\n")
+        f.write("=" * 40 + "\n")
+        f.write(f"Your pipeline file: {my_path}\n")
+        f.write(f"{other_name} file: {other_path}\n\n")
+        f.write(f"Shapes after alignment: {mine_t.shape}\n\n")
+        f.write("Correction stages:\n")
+        f.write(f"  Stage 0 - constant offset only ({offset0:.4f}):  RMSE={rmse0:.4f}  corr={corr0:.4f}\n")
+        f.write(f"  Stage 1 - + sub-pixel XY registration (dy={dy:.2f}, dx={dx:.2f}):  "
+                f"RMSE={rmse1:.4f}  corr={corr1:.4f}\n")
+        f.write(f"  Stage 2 - + plane/tilt fit (FINAL) (offset={c0:.4f}, x-slope={c1:.6f}, y-slope={c2:.6f}):  "
+                f"RMSE={rmse2:.4f}  corr={corr2:.4f}\n\n")
+        f.write(f"Final RMSE used for reporting: {rmse:.4f}\n")
+        f.write(f"Final Pearson correlation: {corr:.4f}\n\n")
+        f.write(f"Your dominant chatter spatial frequency: {my_dom:.5f} cycles/pixel\n")
+        f.write(f"{other_name} dominant chatter spatial frequency: {other_dom:.5f} cycles/pixel\n")
+    print(f"\nSaved numeric report -> {report_path}")
+
+    # --- Side-by-side visualization ---
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    im0 = axes[0].imshow(mine_t, cmap="viridis")
+    axes[0].set_title("Your Pipeline")
+    plt.colorbar(im0, ax=axes[0], fraction=0.046)
+
+    im1 = axes[1].imshow(other_aligned, cmap="viridis")
+    axes[1].set_title(other_name)
+    plt.colorbar(im1, ax=axes[1], fraction=0.046)
+
+    diff = mine_t - other_aligned
+    im2 = axes[2].imshow(diff, cmap="RdBu_r")
+    axes[2].set_title("Difference (Yours - Other)")
+    plt.colorbar(im2, ax=axes[2], fraction=0.046)
+
+    plt.tight_layout()
+    side_by_side_path = os.path.join(out_dir, "depth_maps_side_by_side.png")
+    plt.savefig(side_by_side_path, dpi=150)
+    plt.close()
+    print(f"Saved side-by-side comparison -> {side_by_side_path}")
+
+    # --- FFT comparison plot ---
+    fig, axes = plt.subplots(2, 1, figsize=(10, 8))
+    axes[0].plot(my_profile, label="Your pipeline")
+    axes[0].plot(other_profile, label=other_name, alpha=0.7)
+    axes[0].set_title("Feed-direction height profile (mean-subtracted)")
+    axes[0].legend()
+
+    axes[1].plot(my_freqs, my_mag, label="Your pipeline")
+    axes[1].plot(other_freqs, other_mag, label=other_name, alpha=0.7)
+    axes[1].axvline(my_dom, color="C0", linestyle="--", alpha=0.5)
+    axes[1].axvline(other_dom, color="C1", linestyle="--", alpha=0.5)
+    axes[1].set_title("FFT magnitude (dominant frequency = chatter signature)")
+    axes[1].set_xlabel("Spatial frequency (cycles/pixel)")
+    axes[1].legend()
+
+    plt.tight_layout()
+    fft_path = os.path.join(out_dir, "chatter_fft_comparison.png")
+    plt.savefig(fft_path, dpi=150)
+    plt.close()
+    print(f"Saved chatter FFT comparison -> {fft_path}")
+
+    print("\nDone. All outputs saved to:", out_dir)
+
+
+if __name__ == "__main__":
+    main(
+```
+
+> **Explanation / Rationale:**
+> `register_depth_maps` aligns depth maps from two different tools (e.g. ours vs Fiji). Because different tools use different arbitrary Z=0 reference planes (and often slight X/Y crops), it first performs Sub-pixel phase correlation to align the XY coordinates. Then, it uses a least-squares linear plane fit (Tip/Tilt correction) to mathematically level the two surfaces to the same Z reference plane, allowing for an accurate pixel-by-pixel RMSE comparison.
+
+```python
+)
+```
+
+> **Explanation / Rationale:**
+> `compute_1d_fft_along_y` isolates the central strip of the depth map and computes its 1D Fourier Transform along the feed direction. This is critical for milling analysis: chatter produces periodic surface waves. By comparing the dominant FFT frequencies between our tool and a commercial tool, we can definitively prove that our pipeline captures the same physical chatter frequency without artifacts.

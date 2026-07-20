@@ -19,7 +19,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.config import DATA_DIR
 from src.loader import load_stack
-from src.registration import align_stack
+from src.registration import align_stack, compute_valid_coverage_mask
 from src.drift_check import run_drift_check
 
 
@@ -82,8 +82,27 @@ def main():
         else:
             print("⚠ Registration did not reduce drift — check the data.")
 
+        # PATCH (2026-07-18): Derive the registration-warp-boundary region
+        # directly from the warp matrices actually used for this dataset,
+        # instead of guessing a fixed pixel margin downstream. This is
+        # what 03_run_pipeline.py's 3D visualization uses to exclude the
+        # warp-artifact border from the 3D model — adapts automatically
+        # to however much drift THIS dataset actually had.
+        h, w = stack.shape[1:]
+        valid_mask, coverage = compute_valid_coverage_mask(
+            (h, w), info["warp_matrices"]
+        )
+        n_invalid = int(np.sum(~valid_mask))
+        print(f"\nRegistration coverage: {n_invalid}/{valid_mask.size} pixels "
+              f"({100 * n_invalid / valid_mask.size:.1f}%) lack full-stack "
+              f"coverage (warp-boundary artifact, all layers combined)")
+
         aligned_dir = DATA_DIR / f"{name}_aligned"
         save_aligned_stack(aligned, aligned_dir)
+        np.save(aligned_dir / "valid_coverage_mask.npy", valid_mask)
+        np.save(aligned_dir / "coverage_fraction.npy", coverage)
+        print(f"  Registration coverage mask saved to "
+              f"{aligned_dir / 'valid_coverage_mask.npy'}")
 
 
 if __name__ == "__main__":

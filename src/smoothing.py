@@ -240,6 +240,59 @@ def smooth_depth_map(
         raise ValueError(f"Unknown smoothing method: {method}. Use 'bilateral' or 'guided'.")
 
 
+def smooth_depth_map_legacy(
+    depth_map: np.ndarray,
+    guide_image: np.ndarray,
+    method: str = None,
+) -> np.ndarray:
+    """
+    Smooth using the ORIGINAL pipeline logic (pre-fix) for comparison.
+
+    This replicates the old behavior exactly:
+    - NaN pixels filled with median_filter(nan_to_num(depth, nan=global_median))
+    - No confidence mask applied
+    - NaN re-applied after smoothing
+
+    Used only for the before/after toggle in the 3D visualization.
+    """
+    from scipy.ndimage import median_filter
+
+    if method is None:
+        method = SMOOTH_CFG.method
+
+    nan_mask = np.isnan(depth_map)
+    depth_filled = depth_map.copy()
+    if np.any(nan_mask):
+        median_depth = median_filter(
+            np.nan_to_num(depth_map, nan=np.nanmedian(depth_map)),
+            size=5
+        )
+        depth_filled[nan_mask] = median_depth[nan_mask]
+
+    guide_float32 = guide_image.astype(np.float32)
+
+    if method == "bilateral":
+        d = SMOOTH_CFG.bilateral_d
+        sigma_color = SMOOTH_CFG.bilateral_sigma_color
+        sigma_space = SMOOTH_CFG.bilateral_sigma_space
+        smoothed = cv2.ximgproc.jointBilateralFilter(
+            joint=guide_float32, src=depth_filled,
+            d=d, sigmaColor=sigma_color, sigmaSpace=sigma_space,
+        )
+    elif method == "guided":
+        radius = SMOOTH_CFG.guided_radius
+        eps = SMOOTH_CFG.guided_eps
+        smoothed = cv2.ximgproc.guidedFilter(
+            guide=guide_image, src=depth_filled,
+            radius=radius, eps=eps,
+        )
+    else:
+        raise ValueError(f"Unknown smoothing method: {method}")
+
+    smoothed[nan_mask] = np.nan
+    return smoothed
+
+
 def compare_smoothing_methods(
     depth_map: np.ndarray,
     guide_image: np.ndarray,

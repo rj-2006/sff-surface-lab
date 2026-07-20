@@ -60,6 +60,21 @@ def run_pipeline(dataset_path: Path, args) -> dict:
     stack, metadata = load_stack(dataset_path)
     n_frames, h, w = stack.shape
 
+    # PATCH (2026-07-18): registration.py's align_stack() warps frames with
+    # a hard black-fill border wherever a frame's drift correction pushed
+    # real content outside the original FOV. compute_valid_coverage_mask()
+    # (run during 02_register_frames.py) reconstructs exactly which pixels
+    # have real data in every layer. Only present if this dataset actually
+    # went through registration — no drift, no warp, no mask needed.
+    registration_mask = None
+    coverage_mask_path = dataset_path / "valid_coverage_mask.npy"
+    if coverage_mask_path.exists():
+        registration_mask = np.load(coverage_mask_path)
+        n_border = int(np.sum(~registration_mask))
+        print(f"  Loaded registration coverage mask: {coverage_mask_path} "
+              f"({n_border}/{registration_mask.size} pixels "
+              f"= {100 * n_border / registration_mask.size:.1f}% warp-boundary artifact)")
+
     print(f"\n[2/6] Computing focus measure ({args.method.upper()})...")
     focus_fn = FOCUS_METHODS[args.method]
     focus_volume = focus_fn(stack)
@@ -81,13 +96,8 @@ def run_pipeline(dataset_path: Path, args) -> dict:
 
     if not args.no_smooth:
         print(f"\n[6/6] Smoothing depth map ({args.smoothing})...")
-        # PATCH (2026-07-08): previously `mask` was computed but never passed
-        # here, so low-confidence pixels (flat focus curves, poor Gaussian
-        # fits, scan-range-edge peaks) flowed straight into the edge-aware
-        # smoother, which preserved them as fake "edges" instead of removing
-        # them -> spikes around the border and in low-texture interior
-        # regions. Passing confidence_mask makes smooth_depth_map inpaint
-        # those pixels from their reliable local neighbors before smoothing.
+        # PATCH (2026-07-08): Pass confidence_mask so low-confidence pixels
+        # are inpainted from local neighbors before edge-aware smoothing.
         depth_smoothed = smooth_depth_map(
             depth_map, composite, confidence_mask=mask, method=args.smoothing
         )
@@ -122,7 +132,14 @@ def run_pipeline(dataset_path: Path, args) -> dict:
     plot_depth_map(depth_map, f"{name}_raw", output_dir, f"{name} — Raw Depth Map")
     plot_confidence_overlay(depth_smoothed, confidence, mask, name, output_dir)
     plot_cross_sections(depth_smoothed, dataset_name=name, save_dir=output_dir)
-    plot_3d_surface(depth_smoothed, confidence, name)
+    # PATCH (2026-07-16): Pass mask so plot_3d_surface can exclude the
+    # image-edge-connected unreliable region (border) from the 3D model
+    # only. The 2D depth map, confidence overlay, cross sections, and
+    # dashboard above are unaffected and still show border data.
+    plot_3d_surface(
+        depth_smoothed, confidence, name,
+        mask=mask, registration_mask=registration_mask,
+    )
     plot_diagnostic_dashboard(
         depth_smoothed, confidence, mask, composite,
         global_energy, name, output_dir,
